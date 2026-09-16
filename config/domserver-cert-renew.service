@@ -1,0 +1,7 @@
+[Unit]
+Description=DOMjudge certificate renewal
+After=domserver-nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/domserver-cert-renew

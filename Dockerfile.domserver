@@ -1,0 +1,249 @@
+ARG UBUNTU_VERSION=24.04
+
+FROM ubuntu:${UBUNTU_VERSION} AS domserver-build
+
+ARG DOMJUDGE_VERSION=9.0.1
+ARG DOMJUDGE_SHA256=3d46b31c296581833ac9f8e9b249d929fc28710e834b1cec68723791a2dceb97
+ARG DOMJUDGE_BUILD_BASEURL=https://domserver.invalid/
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY config/99recommends-and-suggests /etc/apt/apt.conf.d/99recommends-and-suggests
+
+RUN sed -E -i \
+		-e 's|https?://archive\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		-e 's|https?://security\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y ca-certificates \
+	&& sed -E -i \
+		-e 's|http://ftp\.kaist\.ac\.kr/ubuntu/?|https://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y etckeeper \
+	&& apt-get install -y software-properties-common \
+	&& add-apt-repository -y ppa:apt-fast/stable \
+	&& apt-get update \
+	&& printf '%s\n' \
+		'apt-fast apt-fast/maxdownloads string 16' \
+		'apt-fast apt-fast/dlflag boolean true' \
+		'apt-fast apt-fast/aptmanager string apt-get' \
+		| debconf-set-selections \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y apt-fast \
+	&& printf '%s\n' \
+		'_APTMGR=apt-get' \
+		'_MAXNUM=16' \
+		'DOWNLOADBEFORE=true' \
+		> /etc/apt-fast.conf \
+	&& apt-fast -y install \
+        acl \
+        autoconf \
+        automake \
+        ca-certificates \
+        composer \
+        curl \
+        gcc \
+        g++ \
+        libcgroup-dev \
+        libmagic-dev \
+        make \
+        php-bcmath \
+        php-cli \
+        php-curl \
+        php-gd \
+        php-gmp \
+        php-intl \
+        php-json \
+        php-mbstring \
+        php-mysql \
+        php-xml \
+        php-zip \
+        pkg-config \
+        unzip \
+        zip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 1001 --shell /bin/bash domjudge
+
+RUN mkdir -p /usr/local/src \
+    && curl --fail --silent --show-error --location \
+        "https://www.domjudge.org/releases/domjudge-${DOMJUDGE_VERSION}.tar.gz" \
+        --output /usr/local/src/domjudge.tar.gz \
+    && echo "${DOMJUDGE_SHA256}  /usr/local/src/domjudge.tar.gz" | sha256sum --check \
+    && tar --extract --gzip --file /usr/local/src/domjudge.tar.gz \
+        --directory /usr/local/src \
+    && rm /usr/local/src/domjudge.tar.gz \
+    && chown --recursive domjudge:domjudge /usr/local/src/domjudge-${DOMJUDGE_VERSION}
+
+WORKDIR /usr/local/src/domjudge-${DOMJUDGE_VERSION}
+
+RUN touch etc/dbpasswords.secret \
+        etc/restapi.secret \
+        etc/symfony_app.secret \
+        etc/initial_admin_password.secret \
+    && chown domjudge:domjudge \
+        etc/dbpasswords.secret \
+        etc/restapi.secret \
+        etc/symfony_app.secret \
+        etc/initial_admin_password.secret
+
+USER domjudge
+
+RUN ./configure \
+        --with-baseurl="${DOMJUDGE_BUILD_BASEURL}" \
+        --with-domjudge-user=domjudge \
+        --disable-doc-build \
+    && make --jobs="$(nproc)" domserver
+
+USER root
+
+RUN make --jobs="$(nproc)" install-domserver \
+    && mkdir -p /opt/domjudge/doc \
+    && touch /opt/domjudge/doc/.container-placeholder \
+    && rm -f /opt/domjudge/domserver/etc/*.secret
+
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG DOMJUDGE_VERSION=9.0.1
+
+LABEL org.opencontainers.image.title="DOMjudge DOMserver"
+LABEL org.opencontainers.image.version="${DOMJUDGE_VERSION}"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY config/99recommends-and-suggests /etc/apt/apt.conf.d/99recommends-and-suggests
+
+RUN useradd --create-home --uid 1001 --shell /bin/bash domjudge
+
+RUN sed -E -i \
+		-e 's|https?://archive\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		-e 's|https?://security\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y ca-certificates \
+	&& sed -E -i \
+		-e 's|http://ftp\.kaist\.ac\.kr/ubuntu/?|https://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y etckeeper \
+	&& apt-get install -y software-properties-common \
+	&& add-apt-repository -y ppa:apt-fast/stable \
+	&& apt-get update \
+	&& printf '%s\n' \
+		'apt-fast apt-fast/maxdownloads string 16' \
+		'apt-fast apt-fast/dlflag boolean true' \
+		'apt-fast apt-fast/aptmanager string apt-get' \
+		| debconf-set-selections \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y apt-fast \
+	&& printf '%s\n' \
+		'_APTMGR=apt-get' \
+		'_MAXNUM=16' \
+		'DOWNLOADBEFORE=true' \
+		> /etc/apt-fast.conf \
+	&& apt-fast -y install \
+        acl \
+        ca-certificates \
+        curl \
+        dbus \
+        dnsutils \
+        enscript \
+        iproute2 \
+        libmagic1 \
+        lpr \
+        mariadb-client \
+        nginx-extras \
+        openssl \
+        php-bcmath \
+        php-cli \
+        php-curl \
+        php-fpm \
+        php-gd \
+        php-gmp \
+        php-intl \
+        php-json \
+        php-mbstring \
+        php-mysql \
+        php-xml \
+        php-zip \
+        python3-requests \
+        python3-venv \
+        python3-yaml \
+        rsync \
+        socat \
+        systemd \
+        systemd-sysv \
+        tzdata \
+        unzip \
+        zip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=domserver-build /opt/domjudge/domserver /usr/local/share/domjudge/domserver-root
+COPY --from=domserver-build /opt/domjudge/doc /opt/domjudge/doc
+COPY config/nginx-domserver-app.conf /etc/nginx/domserver-app.conf
+COPY config/domserver-nginx.service /etc/systemd/system/domserver-nginx.service
+COPY config/domserver-php-fpm.service /etc/systemd/system/domserver-php-fpm.service
+COPY config/domserver-cert-renew.service /etc/systemd/system/domserver-cert-renew.service
+COPY config/domserver-cert-renew.timer /etc/systemd/system/domserver-cert-renew.timer
+COPY scripts/domserver-entrypoint.sh /usr/local/bin/domserver-entrypoint
+COPY scripts/common.sh /usr/local/lib/domjudge/common.sh
+COPY scripts/domserver-switch-cert /usr/local/bin/domserver-switch-cert
+COPY scripts/domserver-cert-renew.sh /usr/local/bin/domserver-cert-renew
+
+ARG ACME_SH_COMMIT=3661fd86b6304115e42f43910e6dd452ab9866d6
+ARG ACME_SH_SHA256=9af3ad3d775a5782246df4cdd4b4e7b9b3179deb63c509b10e3ba0433093a884
+
+RUN rm -f /etc/nginx/sites-enabled/default \
+        /etc/php/8.3/fpm/pool.d/www.conf \
+        /etc/systemd/system/multi-user.target.wants/nginx.service \
+        /etc/systemd/system/multi-user.target.wants/php8.3-fpm.service \
+        /etc/systemd/system/timers.target.wants/certbot.timer \
+    && mkdir -p \
+        /opt/domjudge/domserver \
+        /opt/domjudge/certs \
+        /run/php \
+        /var/log/nginx \
+        /usr/local/share/domjudge \
+        /etc/systemd/system/multi-user.target.wants \
+        /etc/systemd/system/timers.target.wants \
+    && ln -s /etc/systemd/system/domserver-php-fpm.service \
+        /etc/systemd/system/multi-user.target.wants/domserver-php-fpm.service \
+    && ln -s /etc/systemd/system/domserver-nginx.service \
+        /etc/systemd/system/multi-user.target.wants/domserver-nginx.service \
+    && chmod 755 \
+        /usr/local/bin/domserver-entrypoint \
+        /usr/local/bin/domserver-switch-cert \
+        /usr/local/bin/domserver-cert-renew \
+    && mkdir -p /usr/local/src/acme.sh \
+    && curl --fail --silent --show-error --location \
+        "https://github.com/acmesh-official/acme.sh/archive/${ACME_SH_COMMIT}.tar.gz" \
+        --output /usr/local/src/acme.sh.tar.gz \
+    && echo "${ACME_SH_SHA256}  /usr/local/src/acme.sh.tar.gz" | sha256sum --check \
+    && tar --extract --gzip --strip-components=1 \
+        --file /usr/local/src/acme.sh.tar.gz \
+        --directory /usr/local/src/acme.sh \
+    && install -m 0755 /usr/local/src/acme.sh/acme.sh \
+        /usr/local/bin/acme.sh \
+    && rm -rf /usr/local/src/acme.sh /usr/local/src/acme.sh.tar.gz \
+    && printf '%s\n' \
+        'upload_max_filesize = 256M' \
+        'post_max_size = 256M' \
+        'max_file_uploads = 101' \
+        > /etc/php/8.3/fpm/conf.d/99-domserver-container.ini
+
+ARG CERTBOT_VERSION=5.8.0
+RUN python3 -m venv /opt/certbot \
+    && /opt/certbot/bin/pip install --no-cache-dir "certbot==${CERTBOT_VERSION}" \
+    && ln -s /opt/certbot/bin/certbot /usr/local/bin/certbot
+
+STOPSIGNAL SIGRTMIN+3
+
+ENV DOMSERVER_MARIADB_ADDR=127.0.0.1 \
+    DOMSERVER_MARIADB_PORT=3306 \
+    DOMSERVER_BIND_ADDR=*
+
+EXPOSE 80 443
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=5 \
+    CMD curl --fail --silent http://127.0.0.1:8080/ >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/domserver-entrypoint"]

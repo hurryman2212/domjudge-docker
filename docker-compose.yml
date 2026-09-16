@@ -1,0 +1,110 @@
+secrets:
+  domserver_db_root_password:
+    file: domserver-db-root-password
+  domserver_db_password:
+    file: domserver-db-password
+  judgehost_domserver_password:
+    file: judgehost-domserver-password
+  domserver_admin_username:
+    file: domserver-admin-username
+  domserver_admin_password:
+    file: domserver-admin-password
+  zerossl_eab_kid:
+    file: zerossl-eab-kid
+  zerossl_hmac_key:
+    file: zerossl-hmac-key
+
+services:
+  mariadb:
+    build:
+      context: .
+      dockerfile: Dockerfile.mariadb
+    image: domjudge-mariadb:10.11
+    network_mode: host
+    secrets:
+      - domserver_db_root_password
+      - domserver_db_password
+    environment:
+      MARIADB_BIND_ADDR: ${MARIADB_BIND_ADDR-127.0.0.1}
+      MARIADB_BIND_PORT: ${MARIADB_BIND_PORT-3306}
+    command:
+      - --max-connections=1000
+      - --max-allowed-packet=512M
+      - --innodb_snapshot_isolation=OFF
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  domserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.domserver
+    image: domjudge-domserver:9.0.1
+    network_mode: host
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    secrets:
+      - domserver_db_root_password
+      - domserver_db_password
+      - judgehost_domserver_password
+      - domserver_admin_username
+      - domserver_admin_password
+      - zerossl_eab_kid
+      - zerossl_hmac_key
+    privileged: true
+    cgroup: host
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /run
+      - /run/lock
+    environment:
+      DOMSERVER_HOSTS: ${DOMSERVER_HOSTS-}
+      DOMSERVER_BIND_ADDR: ${DOMSERVER_BIND_ADDR-*}
+      DOMSERVER_RESTRICT_HOSTS:
+      DOMSERVER_MARIADB_ADDR: ${DOMSERVER_MARIADB_ADDR-127.0.0.1}
+      DOMSERVER_MARIADB_PORT: ${DOMSERVER_MARIADB_PORT-3306}
+      DOMSERVER_CERT: ${DOMSERVER_CERT:-auto}
+      DOMSERVER_HTTP_PORT: ${DOMSERVER_HTTP_PORT-80}
+      DOMSERVER_HTTPS_PORT: ${DOMSERVER_HTTPS_PORT-443}
+      DOMSERVER_HTTPS_REDIRECT_TO_HTTP: ${DOMSERVER_HTTPS_REDIRECT_TO_HTTP:-false}
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      start_period: 45s
+      retries: 5
+
+  judgehost:
+    build:
+      context: .
+      dockerfile: Dockerfile.judgehost
+    image: domjudge-judgehost:9.0.1
+    network_mode: host
+    depends_on:
+      - domserver
+    secrets:
+      - judgehost_domserver_password
+    privileged: true
+    cgroup: host
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /run
+      - /run/lock
+    environment:
+      DOMSERVER_HOSTS: ${DOMSERVER_HOSTS-}
+      DOMSERVER_HTTP_PORT: ${DOMSERVER_HTTP_PORT-80}
+      DOMSERVER_HTTPS_PORT: ${DOMSERVER_HTTPS_PORT-443}
+      DOMSERVER_HTTPS_REDIRECT_TO_HTTP: ${DOMSERVER_HTTPS_REDIRECT_TO_HTTP:-false}
+      JUDGEHOST_CPU_RANGE: ${JUDGEHOST_CPU_RANGE-}
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "pgrep", "--full", "/opt/domjudge/judgehost/bin/judgedaemon"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

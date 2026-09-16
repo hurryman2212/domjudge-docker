@@ -1,0 +1,194 @@
+ARG UBUNTU_VERSION=24.04
+
+FROM ubuntu:${UBUNTU_VERSION} AS judgehost-build
+
+ARG DOMJUDGE_VERSION=9.0.1
+ARG DOMJUDGE_SHA256=3d46b31c296581833ac9f8e9b249d929fc28710e834b1cec68723791a2dceb97
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY config/99recommends-and-suggests /etc/apt/apt.conf.d/99recommends-and-suggests
+
+RUN sed -E -i \
+		-e 's|https?://archive\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		-e 's|https?://security\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y ca-certificates \
+	&& sed -E -i \
+		-e 's|http://ftp\.kaist\.ac\.kr/ubuntu/?|https://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y etckeeper \
+	&& apt-get install -y software-properties-common \
+	&& add-apt-repository -y ppa:apt-fast/stable \
+	&& apt-get update \
+	&& printf '%s\n' \
+		'apt-fast apt-fast/maxdownloads string 16' \
+		'apt-fast apt-fast/dlflag boolean true' \
+		'apt-fast apt-fast/aptmanager string apt-get' \
+		| debconf-set-selections \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y apt-fast \
+	&& printf '%s\n' \
+		'_APTMGR=apt-get' \
+		'_MAXNUM=16' \
+		'DOWNLOADBEFORE=true' \
+		> /etc/apt-fast.conf \
+	&& apt-fast -y install \
+        autoconf \
+        automake \
+        bsdmainutils \
+        ca-certificates \
+        composer \
+        curl \
+        debootstrap \
+        gcc \
+        g++ \
+        git \
+        libcurl4-gnutls-dev \
+        libcgroup-dev \
+        libjsoncpp-dev \
+        libmagic-dev \
+        lsb-release \
+        make \
+        ntp \
+        php-curl \
+        php-gd \
+        php-gmp \
+        php-json \
+        php-mbstring \
+        php-mysql \
+        php-xml \
+        php-zip \
+        pkg-config \
+        procps \
+        sudo \
+        unzip \
+        zip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 1001 --shell /bin/bash domjudge
+
+RUN mkdir -p /usr/local/src \
+    && curl --fail --silent --show-error --location \
+        "https://www.domjudge.org/releases/domjudge-${DOMJUDGE_VERSION}.tar.gz" \
+        --output /usr/local/src/domjudge.tar.gz \
+    && echo "${DOMJUDGE_SHA256}  /usr/local/src/domjudge.tar.gz" | sha256sum --check \
+    && tar --extract --gzip --file /usr/local/src/domjudge.tar.gz \
+        --directory /usr/local/src \
+    && rm /usr/local/src/domjudge.tar.gz \
+    && chown --recursive domjudge:domjudge /usr/local/src/domjudge-${DOMJUDGE_VERSION}
+
+WORKDIR /usr/local/src/domjudge-${DOMJUDGE_VERSION}
+
+RUN printf '%s\n' 'default\thttp://domserver.invalid/api/v4\tdummy\tdummy' \
+        > etc/restapi.secret \
+    && chown domjudge:domjudge etc/restapi.secret
+
+USER domjudge
+
+RUN ./configure \
+        --with-baseurl=http://domserver.invalid/ \
+        --with-domjudge-user=domjudge \
+        --with-judgehost_chrootdir=/chroot/domjudge \
+        --disable-doc-build \
+    && make --jobs="$(nproc)" judgehost
+
+USER root
+
+RUN make --jobs="$(nproc)" install-judgehost \
+    && rm -f /opt/domjudge/judgehost/etc/*.secret
+
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG DOMJUDGE_VERSION=9.0.1
+
+LABEL org.opencontainers.image.title="DOMjudge judgehost"
+LABEL org.opencontainers.image.version="${DOMJUDGE_VERSION}"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY config/99recommends-and-suggests /etc/apt/apt.conf.d/99recommends-and-suggests
+
+RUN useradd --create-home --uid 1001 --shell /bin/bash domjudge
+
+RUN sed -E -i \
+		-e 's|https?://archive\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		-e 's|https?://security\.ubuntu\.com/ubuntu/?|http://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y ca-certificates \
+	&& sed -E -i \
+		-e 's|http://ftp\.kaist\.ac\.kr/ubuntu/?|https://ftp.kaist.ac.kr/ubuntu/|g' \
+		/etc/apt/sources.list.d/ubuntu.sources \
+	&& apt-get update \
+	&& apt-get install -y etckeeper \
+	&& apt-get install -y software-properties-common \
+	&& add-apt-repository -y ppa:apt-fast/stable \
+	&& apt-get update \
+	&& printf '%s\n' \
+		'apt-fast apt-fast/maxdownloads string 16' \
+		'apt-fast apt-fast/dlflag boolean true' \
+		'apt-fast apt-fast/aptmanager string apt-get' \
+		| debconf-set-selections \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y apt-fast \
+	&& printf '%s\n' \
+		'_APTMGR=apt-get' \
+		'_MAXNUM=16' \
+		'DOWNLOADBEFORE=true' \
+		> /etc/apt-fast.conf \
+	&& apt-fast -y install \
+        acl \
+        bsdmainutils \
+        ca-certificates \
+        curl \
+        debootstrap \
+        dbus \
+        gcc \
+        g++ \
+        libatomic1 \
+        libcgroup2 \
+        libcurl4 \
+        libmagic1 \
+        lsb-release \
+        mount \
+        php-cli \
+        php-curl \
+        php-gd \
+        php-gmp \
+        php-json \
+        php-mbstring \
+        php-mysql \
+        php-xml \
+        php-zip \
+        procps \
+        rsync \
+        sudo \
+        systemd \
+        systemd-sysv \
+        tzdata \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=judgehost-build /opt/domjudge/judgehost /usr/local/share/domjudge/judgehost-root
+COPY --from=judgehost-build /opt/domjudge/judgehost/etc/sudoers-domjudge \
+    /etc/sudoers.d/domjudge
+COPY config/domjudge-judgedaemon@.service /usr/local/share/domjudge/domjudge-judgedaemon@.service.template
+COPY scripts/judgehost-entrypoint.sh /usr/local/bin/judgehost-entrypoint
+COPY scripts/common.sh /usr/local/lib/domjudge/common.sh
+
+RUN chmod 0440 /etc/sudoers.d/domjudge \
+    && visudo --check --file=/etc/sudoers.d/domjudge \
+    && chmod 755 /usr/local/bin/judgehost-entrypoint \
+    && mkdir -p \
+        /chroot \
+        /opt/domjudge/judgehost \
+        /usr/local/share/domjudge \
+        /etc/systemd/system/multi-user.target.wants
+
+STOPSIGNAL SIGRTMIN+3
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
+    CMD pgrep --full '/opt/domjudge/judgehost/bin/judgedaemon' >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/judgehost-entrypoint"]
