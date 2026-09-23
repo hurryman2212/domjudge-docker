@@ -1,0 +1,16 @@
+[Unit]
+Description=DOMjudge judgedaemon on CPU %i
+After=network-online.target
+
+[Service]
+Type=simple
+User=domjudge
+Group=domjudge
+Environment=DOMJUDGE_CREATE_WRITABLE_TEMP_DIR=__CREATE_WRITABLE_TEMP_DIR__
+ExecStart=/opt/domjudge/judgehost/bin/judgedaemon -n %i
+Restart=on-failure
+RestartSec=2s
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

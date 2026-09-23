@@ -1,0 +1,14 @@
+.git
+.env
+.create-passwords.*
+domserver-db-root-password
+domserver-db-password
+judgehost-domserver-password
+domserver-admin-username
+domserver-admin-password
+zerossl-eab-kid
+zerossl-hmac-key
+certs
+domserver-root
+judgehost-root
+mariadb

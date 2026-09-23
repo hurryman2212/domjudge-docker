@@ -1,0 +1,15 @@
+[Unit]
+Description=DOMjudge nginx
+After=network-online.target domserver-php-fpm.service
+Requires=domserver-php-fpm.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/nginx -t
+ExecStart=/usr/sbin/nginx -g "daemon off;"
+ExecReload=/usr/sbin/nginx -s reload
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

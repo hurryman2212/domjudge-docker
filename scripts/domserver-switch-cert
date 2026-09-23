@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly LOG_PREFIX=certificate
+# shellcheck source=scripts/common.sh
+source /usr/local/lib/domjudge/common.sh
+
+readonly CERT_DIR=/opt/domjudge/certs
+readonly ACTIVE_SOURCE_FILE="${CERT_DIR}/.active"
+readonly ACTIVE_CERT="${CERT_DIR}/domserver.fullchain.pem"
+readonly ACTIVE_KEY="${CERT_DIR}/domserver.privkey.pem"
+readonly USER_DIR="${CERT_DIR}/user"
+readonly EAB_KID_FILE="${CERT_DIR}/zerossl-eab-kid"
+readonly EAB_HMAC_FILE="${CERT_DIR}/zerossl-hmac-key"
+EAB_KID=''
+EAB_HMAC_KEY=''
+EAB_KID_SUPPLIED=0
+EAB_HMAC_SUPPLIED=0
+readonly -a AUTO_METHODS=(
+	certbot-zerossl
+	certbot-letscrypt
+	acme-zerossl
+	acme-letscrypt
+)
+
+usage() {
+	cat >&2 <<'EOF'
+usage:
+  domserver-switch-cert SELECTOR [--zerossl-eab-kid VALUE] [--zerossl-hmac-key VALUE]
+
+SELECTOR:
+  auto | certbot-zerossl | certbot-letscrypt | acme-zerossl | acme-letscrypt | user
+
+DOMSERVER_HOSTS is a comma-separated list of domains and IP addresses.
+An empty list discovers public IPs per interface and verified reverse DNS names;
+later calls reuse saved targets.
+IP targets require Let's Encrypt (short-lived certificates) or user.
+auto skips unsupported methods and falls back to a self-signed user certificate.
+
+ZeroSSL needs both EAB values. Supply them with the options above or place them in:
+  /opt/domjudge/certs/zerossl-eab-kid
+  /opt/domjudge/certs/zerossl-hmac-key
+
+Options override their corresponding files and are saved only after a ZeroSSL
+selector succeeds. They may be used with auto or a ZeroSSL selector.
+EOF
+	exit "${1:-2}"
+}
+
+validate_method() {
+	case "$1" in
+	auto | certbot-zerossl | certbot-letscrypt | acme-zerossl | acme-letscrypt | user) ;;
+	*) die "unsupported certificate selector: $1" ;;
+	esac
+}
+
+is_zero_ssl_method() {
+	case "$1" in
+	certbot-zerossl | acme-zerossl) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+zero_ssl_eab_available() {
+	[[ -n "$EAB_KID" && -n "$EAB_HMAC_KEY" &&
+		"$EAB_KID" != *$'\n'* && "$EAB_KID" != *$'\r'* &&
+		"$EAB_HMAC_KEY" != *$'\n'* && "$EAB_HMAC_KEY" != *$'\r'* ]]
+}
+
+load_eab_values() {
+	if ((EAB_KID_SUPPLIED == 0)) &&
+		[[ -f "$EAB_KID_FILE" && -r "$EAB_KID_FILE" ]]; then
+		EAB_KID="$(<"$EAB_KID_FILE")"
+	fi
+	if ((EAB_HMAC_SUPPLIED == 0)) &&
+		[[ -f "$EAB_HMAC_FILE" && -r "$EAB_HMAC_FILE" ]]; then
+		EAB_HMAC_KEY="$(<"$EAB_HMAC_FILE")"
+	fi
+}
+
+save_eab_overrides() {
+	local temporary_dir
+	local name
+
+	((EAB_KID_SUPPLIED || EAB_HMAC_SUPPLIED)) || return 0
+	umask 077
+	temporary_dir="$(mktemp -d "${CERT_DIR}/.eab.XXXXXX")" || return 1
+	if ((EAB_KID_SUPPLIED)); then
+		printf '%s\n' "$EAB_KID" >"${temporary_dir}/zerossl-eab-kid" || {
+			rm -rf "$temporary_dir"
+			return 1
+		}
+	fi
+	if ((EAB_HMAC_SUPPLIED)); then
+		printf '%s\n' "$EAB_HMAC_KEY" >"${temporary_dir}/zerossl-hmac-key" || {
+			rm -rf "$temporary_dir"
+			return 1
+		}
+	fi
+	for name in zerossl-eab-kid zerossl-hmac-key; do
+		if [[ -f "${temporary_dir}/${name}" ]]; then
+			mv -f "${temporary_dir}/${name}" "${CERT_DIR}/${name}" || {
+				rm -rf "$temporary_dir"
+				return 1
+			}
+		fi
+	done
+	rm -rf "$temporary_dir"
+}
+
+method_dir() {
+	printf '%s/%s\n' "$CERT_DIR" "$1"
+}
+
+validate_pair() {
+	local cert="$1"
+	local key="$2"
+
+	pair_matches_hosts "$cert" "$key" ||
+		die "certificate pair is invalid or does not cover DOMSERVER_HOSTS: $cert and $key"
+}
+
+mark_initialized() {
+	local method="$1"
+	local directory
+
+	directory="$(method_dir "$method")"
+	mkdir -p "$directory" || return 1
+	printf '%s\n' "$DOMSERVER_HOSTS" >"${directory}/.hosts" || return 1
+	if [[ ! -s "${directory}/.name" ]]; then
+		printf '%s\n' "${DOMSERVER_HOST_LIST[0]}" >"${directory}/.name" || return 1
+	fi
+	touch "${directory}/.inited" || return 1
+	chmod 600 "${directory}/.inited" "${directory}/.hosts" "${directory}/.name"
+}
+
+reload_nginx() {
+	if pgrep --exact nginx >/dev/null 2>&1; then
+		nginx -t >/dev/null || return 1
+		nginx -s reload || return 1
+	fi
+}
+
+enable_renewal() {
+	local wants_dir=/etc/systemd/system/timers.target.wants
+
+	mkdir -p "$wants_dir" || return 1
+	ln -sfn /etc/systemd/system/domserver-cert-renew.timer \
+		"${wants_dir}/domserver-cert-renew.timer" || return 1
+	if pgrep --exact systemd >/dev/null 2>&1; then
+		systemctl daemon-reload || return 1
+		systemctl enable --now domserver-cert-renew.timer >/dev/null || return 1
+	fi
+}
+
+disable_renewal() {
+	rm -f /etc/systemd/system/timers.target.wants/domserver-cert-renew.timer || return 1
+	if pgrep --exact systemd >/dev/null 2>&1; then
+		systemctl disable --now domserver-cert-renew.timer >/dev/null 2>&1 || return 1
+		systemctl daemon-reload || return 1
+	fi
+}
+
+switch_active() {
+	local method="$1"
+
+	validate_method "$method"
+	validate_pair "${CERT_DIR}/${method}/fullchain.pem" \
+		"${CERT_DIR}/${method}/privkey.pem"
+	ln -sfn "${method}/fullchain.pem" "$ACTIVE_CERT" || return 1
+	ln -sfn "${method}/privkey.pem" "$ACTIVE_KEY" || return 1
+	printf '%s\n' "$method" >"$ACTIVE_SOURCE_FILE" || return 1
+	chmod 600 "$ACTIVE_SOURCE_FILE" || return 1
+	reload_nginx || return 1
+	printf '%s\n' "$DOMSERVER_HOSTS" >"${CERT_DIR}/hosts" || return 1
+	chmod 600 "${CERT_DIR}/hosts" || return 1
+	log "active certificate switched to ${method}"
+}
+
+create_user_certificate() {
+	local san='' host type
+
+	for host in "${DOMSERVER_HOST_LIST[@]}"; do
+		type=DNS
+		if is_ip "$host"; then type=IP; fi
+		san+="${san:+,}${type}:${host}"
+	done
+	mkdir -p "$USER_DIR" || return 1
+	log "creating self-signed certificate for ${DOMSERVER_HOSTS}"
+	openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+		-subj /CN=DOMjudge -addext "subjectAltName=${san}" \
+		-keyout "${USER_DIR}/privkey.pem" \
+		-out "${USER_DIR}/fullchain.pem" \
+		>/dev/null 2>&1 || return 1
+	sha256sum "${USER_DIR}/fullchain.pem" >"${USER_DIR}/.self-signed" || return 1
+	chmod 600 "${USER_DIR}/privkey.pem" "${USER_DIR}/.self-signed" || return 1
+	chmod 644 "${USER_DIR}/fullchain.pem"
+}
+
+activate_user() {
+	if [[ -e "${USER_DIR}/.self-signed" ]] &&
+		sha256sum --check "${USER_DIR}/.self-signed" >/dev/null 2>&1 &&
+		! pair_matches_hosts "${USER_DIR}/fullchain.pem" "${USER_DIR}/privkey.pem"; then
+		create_user_certificate || return 1
+	elif [[ ! -e "${USER_DIR}/fullchain.pem" && ! -e "${USER_DIR}/privkey.pem" ]]; then
+		create_user_certificate || return 1
+	fi
+	validate_pair "${USER_DIR}/fullchain.pem" "${USER_DIR}/privkey.pem"
+	mark_initialized user || return 1
+	switch_active user || return 1
+	disable_renewal
+}
+
+issue_with_certbot() {
+	local method="$1"
+	local directory
+	local config_dir
+	local work_dir
+	local logs_dir
+	local live_dir
+	local server
+	local host
+	local -a args=()
+
+	directory="$(method_dir "$method")"
+	config_dir="${directory}/certbot/config"
+	work_dir="${directory}/certbot/work"
+	logs_dir="${directory}/certbot/logs"
+	live_dir="${config_dir}/live/${DOMSERVER_HOST_LIST[0]}"
+	case "$method" in
+	certbot-zerossl) server=https://acme.zerossl.com/v2/DV90 ;;
+	certbot-letscrypt) server=https://acme-v02.api.letsencrypt.org/directory ;;
+	*) return 1 ;;
+	esac
+	if [[ "$method" == certbot-zerossl ]]; then
+		args+=(
+			--eab-kid "$EAB_KID"
+			--eab-hmac-key "$EAB_HMAC_KEY"
+		)
+	fi
+
+	for host in "${DOMSERVER_HOST_LIST[@]}"; do
+		if is_ip "$host"; then
+			args+=(--ip-address "$host")
+		else
+			args+=(-d "$host")
+		fi
+	done
+	if ((DOMSERVER_HAS_IP)); then args+=(--required-profile shortlived); fi
+
+	mkdir -p "$config_dir" "$work_dir" "$logs_dir" || return 1
+	run_with_retry 'Certbot certificate request' certbot certonly \
+		--standalone \
+		--non-interactive \
+		--agree-tos \
+		--register-unsafely-without-email \
+		--preferred-challenges http \
+		--server "$server" \
+		"${args[@]}" \
+		--cert-name "${DOMSERVER_HOST_LIST[0]}" \
+		--config-dir "$config_dir" \
+		--work-dir "$work_dir" \
+		--logs-dir "$logs_dir" \
+		--renew-with-new-domains || return 1
+	install -m 0644 "${live_dir}/fullchain.pem" \
+		"${directory}/fullchain.pem" || return 1
+	install -m 0600 "${live_dir}/privkey.pem" \
+		"${directory}/privkey.pem" || return 1
+}
+
+issue_with_acme() {
+	local method="$1"
+	local directory
+	local acme_home
+	local server
+	local host
+	local -a args=()
+
+	directory="$(method_dir "$method")"
+	acme_home="${directory}/acme"
+	case "$method" in
+	acme-zerossl) server=zerossl ;;
+	acme-letscrypt) server=letsencrypt ;;
+	*) return 1 ;;
+	esac
+	if [[ "$method" == acme-zerossl ]]; then
+		args+=(
+			--eab-kid "$EAB_KID"
+			--eab-hmac-key "$EAB_HMAC_KEY"
+		)
+	fi
+
+	for host in "${DOMSERVER_HOST_LIST[@]}"; do args+=(-d "$host"); done
+	if ((DOMSERVER_HAS_IP)); then
+		args+=(--certificate-profile shortlived --days 3)
+	fi
+
+	run_with_retry 'acme.sh certificate request' /usr/local/bin/acme.sh \
+		--issue \
+		--alpn \
+		--server "$server" \
+		"${args[@]}" \
+		--home "$acme_home" \
+		--keylength ec-256 || return 1
+	run_with_retry 'acme.sh certificate installation' /usr/local/bin/acme.sh \
+		--install-cert \
+		-d "${DOMSERVER_HOST_LIST[0]}" \
+		--ecc \
+		--home "$acme_home" \
+		--key-file "${directory}/privkey.pem" \
+		--fullchain-file "${directory}/fullchain.pem" || return 1
+}
+
+issue_with_method() {
+	case "$1" in
+	certbot-zerossl | certbot-letscrypt) issue_with_certbot "$1" ;;
+	acme-zerossl | acme-letscrypt) issue_with_acme "$1" ;;
+	*) return 1 ;;
+	esac
+}
+
+activate_method() {
+	local method="$1"
+	local directory
+	local init_file
+
+	directory="$(method_dir "$method")"
+	init_file="${directory}/.inited"
+	mkdir -p "$directory" || return 1
+	if [[ -e "$init_file" ]]; then
+		if pair_matches_hosts "${directory}/fullchain.pem" \
+			"${directory}/privkey.pem"; then
+			log "reusing initialized certificate ${method}"
+			mark_initialized "$method" || return 1
+			switch_active "$method" || return 1
+			enable_renewal || return 1
+			return 0
+		fi
+		log "initialized certificate ${method} is expired, invalid, or missing requested hosts; issuing again"
+		rm -f "$init_file" || return 1
+	fi
+
+	log "trying certificate method ${method}"
+	with_nginx_stopped issue_with_method "$method" || return 1
+	if ! pair_matches_hosts "${directory}/fullchain.pem" \
+		"${directory}/privkey.pem"; then
+		log "certificate method ${method} did not create a valid pair covering all requested hosts"
+		return 1
+	fi
+	printf '%s\n' "${DOMSERVER_HOST_LIST[0]}" >"${directory}/.name" || return 1
+	mark_initialized "$method" || return 1
+	switch_active "$method" || return 1
+	enable_renewal
+}
+
+activate_auto() {
+	local method error
+
+	for method in "${AUTO_METHODS[@]}"; do
+		error="$(certificate_method_error "$method")"
+		if [[ -n "$error" ]]; then
+			log "skipping ${method}; ${error}"
+			continue
+		fi
+		if is_zero_ssl_method "$method" && ! zero_ssl_eab_available; then
+			log "skipping ${method}; both ZeroSSL EAB values are required"
+			continue
+		fi
+		if activate_method "$method"; then return 0; fi
+		log "certificate method ${method} failed; continuing"
+	done
+	activate_user
+}
+
+main() {
+	local method=''
+	local error
+	local name
+	local value
+
+	while (($#)); do
+		case "$1" in
+		auto | certbot-zerossl | certbot-letscrypt | acme-zerossl | acme-letscrypt | user)
+			[[ -z "$method" ]] || usage
+			method="$1"
+			shift
+			;;
+		--zerossl-eab-kid | --zerossl-hmac-key)
+			[[ $# -ge 2 ]] || usage
+			name="$1"
+			value="$2"
+			[[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || usage
+			if [[ "$name" == --zerossl-eab-kid ]]; then
+				EAB_KID="$value"
+				EAB_KID_SUPPLIED=1
+			else
+				EAB_HMAC_KEY="$value"
+				EAB_HMAC_SUPPLIED=1
+			fi
+			shift 2
+			;;
+		--help | -h) usage 0 ;;
+		*) usage ;;
+		esac
+	done
+	[[ -n "$method" ]] || usage
+	if [[ -z "${DOMSERVER_HOSTS:-}" && -s "${CERT_DIR}/hosts" ]]; then
+		DOMSERVER_HOSTS="$(<"${CERT_DIR}/hosts")"
+	fi
+	normalize_hosts
+	error="$(certificate_method_error "$method")"
+	if [[ -n "$error" ]]; then
+		log "$error"
+		usage
+	fi
+	if ((EAB_KID_SUPPLIED || EAB_HMAC_SUPPLIED)); then
+		if [[ "$method" != auto ]] && ! is_zero_ssl_method "$method"; then
+			usage
+		fi
+		for name in "$EAB_KID_FILE" "$EAB_HMAC_FILE"; do
+			[[ ! -e "$name" || -f "$name" ]] || die "not a regular EAB file: $name"
+		done
+	fi
+	load_eab_values
+	if is_zero_ssl_method "$method" && ! zero_ssl_eab_available; then
+		log "both ZeroSSL EAB values are required for ${method}"
+		usage
+	fi
+	mkdir -p "$CERT_DIR" "$USER_DIR"
+
+	case "$method" in
+	auto) activate_auto || return 1 ;;
+	user) activate_user || return 1 ;;
+	*) activate_method "$method" || return 1 ;;
+	esac
+	if is_zero_ssl_method "$(<"$ACTIVE_SOURCE_FILE")"; then
+		save_eab_overrides
+	fi
+}
+
+main "$@"

@@ -1,0 +1,11 @@
+{% set bannerImage = null %}
+{% if contest is defined and contest is not empty and contest.externalid %}
+    {% set bannerImage = contest.externalid | assetPath('contest') %}
+{% endif %}
+{% if not bannerImage %}
+    {% set bannerImage = globalBannerAssetPath() %}
+{% endif %}
+{% if not bannerImage %}
+    {% set bannerImage = 'images/public-banner.png' %}
+{% endif %}
+<img class="banner mt-2" src="{{ asset(bannerImage) }}" alt="Banner">

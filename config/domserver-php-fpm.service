@@ -1,0 +1,12 @@
+[Unit]
+Description=DOMjudge PHP-FPM
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/php-fpm8.3 --nodaemonize
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

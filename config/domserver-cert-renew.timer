@@ -1,0 +1,11 @@
+[Unit]
+Description=Run DOMjudge certificate renewal twice daily
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+Persistent=true
+Unit=domserver-cert-renew.service
+
+[Install]
+WantedBy=timers.target

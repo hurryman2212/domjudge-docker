@@ -1,0 +1,11 @@
+FROM mariadb:10.11
+
+ENV MARIADB_BIND_ADDR=127.0.0.1 \
+    MARIADB_BIND_PORT=3306
+
+COPY scripts/mariadb-entrypoint.sh /usr/local/bin/domjudge-mariadb-entrypoint
+COPY scripts/common.sh /usr/local/lib/domjudge/common.sh
+
+RUN chmod 0755 /usr/local/bin/domjudge-mariadb-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/domjudge-mariadb-entrypoint"]
